@@ -1,0 +1,9 @@
+{
+  "name": "bioharmonize-agent3",
+  "version": "1.0.0",
+  "description": "BioHarmonize Agent 3: Auto-Publisher (Vercel cron). Publishes approved derivatives to Shopify, Reddit, Klaviyo, X.",
+  "type": "module",
+  "scripts": {
+    "test": "node test-local.js"
+  }
+}
