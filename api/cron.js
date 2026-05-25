@@ -382,7 +382,6 @@ async function publishToKlaviyo({ slug, content }) {
           options_static: {
             datetime: new Date(Date.now() + 24 * 3600_000).toISOString(),
             is_local: false,
-            send_past_recipients_immediately: false,
           },
         },
         "campaign-messages": {
