@@ -272,12 +272,14 @@ async function publishToShopify({ slug, content }) {
     return { skipped: true, reason: `Shopify blog with handle "${blogHandle}" not found. Found: ${blogs.map((b) => b.handle).join(", ")}` };
   }
 
-  // Create article
+  // Create article. Author is required by ArticleCreateInput.
+  const authorName = process.env.SHOPIFY_AUTHOR_NAME || "BioHarmonize";
+  const publicDomain = process.env.SHOPIFY_PUBLIC_DOMAIN || "bioharmonize.co";
   const mutation = `
     mutation articleCreate($article: ArticleCreateInput!) {
       articleCreate(article: $article) {
-        article { id title handle onlineStoreUrl }
-        userErrors { field message }
+        article { id title handle }
+        userErrors { field message code }
       }
     }`;
   const variables = {
@@ -288,6 +290,7 @@ async function publishToShopify({ slug, content }) {
       body: bodyHtml,
       isPublished: true,
       publishDate: new Date().toISOString(),
+      author: { name: authorName },
     },
   };
   const createRes = await fetch(`https://${domain}/admin/api/2024-10/graphql.json`, {
@@ -302,16 +305,23 @@ async function publishToShopify({ slug, content }) {
     throw new Error(`Shopify articleCreate HTTP failed: ${createRes.status} ${await createRes.text()}`);
   }
   const createData = await createRes.json();
+  // Top-level GraphQL errors (schema/validation) come back outside of userErrors
+  if (Array.isArray(createData?.errors) && createData.errors.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(createData.errors)}`);
+  }
   const errs = createData?.data?.articleCreate?.userErrors || [];
   if (errs.length) {
     throw new Error(`Shopify userErrors: ${JSON.stringify(errs)}`);
   }
   const article = createData?.data?.articleCreate?.article;
+  if (!article?.id) {
+    throw new Error(`Shopify articleCreate returned no article: ${JSON.stringify(createData)}`);
+  }
   return {
     success: true,
     platform: "shopify",
-    articleId: article?.id,
-    url: article?.onlineStoreUrl || `https://${domain.replace(/\.myshopify\.com$/, "")}/blogs/${blogHandle}/${slug}`,
+    articleId: article.id,
+    url: `https://${publicDomain}/blogs/${blogHandle}/${slug}`,
   };
 }
 
