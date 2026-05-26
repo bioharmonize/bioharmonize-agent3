@@ -24,6 +24,8 @@ import crypto from "crypto";
 const PUBLISHED_FOLDER = "/BioHarmonize/03_Published";
 const DONE_FOLDER = "/BioHarmonize/04_Done";
 const STATUS_FOLDER = "/BioHarmonize/_status";
+const ALERTS_FOLDER = "/BioHarmonize/_alerts";
+const AGENT_NAME = "agent_3_publisher";
 
 // Schedule mapping (Pacific day -> channels). Cron runs at 16:00 UTC = 9am PDT / 8am PST.
 const SCHEDULE = {
@@ -210,12 +212,66 @@ async function writeStatus(payload) {
   try {
     await ensureFolder(STATUS_FOLDER);
     await uploadJsonFile(`${STATUS_FOLDER}/agent_3_last_run.json`, {
-      agent: "agent_3_publisher",
+      agent: AGENT_NAME,
       ...payload,
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
     console.warn("writeStatus failed:", err.message);
+  }
+}
+
+// Fires a pipeline alert: writes durable JSON to Dropbox /_alerts/ and
+// optionally fires a Klaviyo event so a flow can email the owner.
+// Klaviyo flow setup is a one-time manual step; without it, Dropbox alerts
+// still accrue and the dashboard surfaces them.
+async function sendAlert({ severity = "error", summary, detail, context = {} }) {
+  const ts = new Date().toISOString();
+  const safeTs = ts.replace(/[:.]/g, "-");
+  const alert = { ts, agent: AGENT_NAME, severity, summary, detail: String(detail || "").slice(0, 8000), context };
+
+  // 1. Durable log in Dropbox
+  try {
+    await ensureFolder(ALERTS_FOLDER);
+    await uploadJsonFile(`${ALERTS_FOLDER}/${safeTs}_${AGENT_NAME}.json`, alert);
+  } catch (err) {
+    console.warn("sendAlert: dropbox write failed:", err.message);
+  }
+
+  // 2. Optional Klaviyo event push
+  if (!process.env.KLAVIYO_API_KEY || !process.env.ALERT_EMAIL) return;
+  try {
+    await fetch("https://a.klaviyo.com/api/events/", {
+      method: "POST",
+      headers: {
+        Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
+        "Content-Type": "application/json",
+        accept: "application/json",
+        revision: "2024-10-15",
+      },
+      body: JSON.stringify({
+        data: {
+          type: "event",
+          attributes: {
+            properties: {
+              agent: AGENT_NAME,
+              severity,
+              summary,
+              detail: alert.detail,
+              ...context,
+            },
+            metric: {
+              data: { type: "metric", attributes: { name: "BioHarmonize Pipeline Alert" } },
+            },
+            profile: {
+              data: { type: "profile", attributes: { email: process.env.ALERT_EMAIL } },
+            },
+          },
+        },
+      }),
+    });
+  } catch (err) {
+    console.warn("sendAlert: klaviyo fire failed:", err.message);
   }
 }
 
@@ -717,11 +773,41 @@ export default async function handler(req, res) {
       results,
     };
     await writeStatus(payload);
+
+    // Per-channel failure detection: any result with success:false (or error)
+    // gets its own alert. Skipped-with-reason for a channel that has creds
+    // configured also alerts.
+    if (!dryRun) {
+      for (const r of results) {
+        if (r && r.success === false) {
+          await sendAlert({
+            severity: "error",
+            summary: `Agent 3: ${r.channel} publish failed for ${r.file || "(no file)"}`,
+            detail: r.error || JSON.stringify(r),
+            context: { day, channel: r.channel, file: r.file || null },
+          });
+        } else if (r && r.skipped && r.reason && !/No matching file/i.test(r.reason)) {
+          // Skipped for a reason other than "nothing to publish" — usually misconfig
+          await sendAlert({
+            severity: "warning",
+            summary: `Agent 3: ${r.channel} skipped (${r.reason})`,
+            detail: JSON.stringify(r),
+            context: { day, channel: r.channel },
+          });
+        }
+      }
+    }
     return res.status(200).json({ ...payload, timestamp: new Date().toISOString() });
   } catch (err) {
     console.error("Agent 3 failed:", err);
     const payload = { ok: false, error: err.message, stack: err.stack };
     await writeStatus(payload).catch(() => {});
+    await sendAlert({
+      severity: "error",
+      summary: `Agent 3 crashed (${err.message?.slice(0, 80) || "unknown"})`,
+      detail: `${err.message}\n\n${err.stack}`,
+      context: { day },
+    }).catch(() => {});
     return res.status(500).json({ ...payload, timestamp: new Date().toISOString() });
   }
 }
