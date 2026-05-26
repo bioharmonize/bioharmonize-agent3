@@ -21,6 +21,7 @@
 
 const PUBLISHED_FOLDER = "/BioHarmonize/03_Published";
 const DONE_FOLDER = "/BioHarmonize/04_Done";
+const STATUS_FOLDER = "/BioHarmonize/_status";
 
 // Schedule mapping (Pacific day -> channels). Cron runs at 16:00 UTC = 9am PDT / 8am PST.
 const SCHEDULE = {
@@ -185,6 +186,34 @@ async function ensureFolder(path) {
     if (!/path\/conflict\/folder/.test(txt)) {
       console.warn(`ensureFolder ${path} non-fatal:`, txt.slice(0, 200));
     }
+  }
+}
+
+async function uploadJsonFile(path, obj) {
+  const res = await fetch("https://content.dropboxapi.com/2/files/upload", {
+    method: "POST",
+    headers: {
+      ...(await dropboxAuth()),
+      "Content-Type": "application/octet-stream",
+      "Dropbox-API-Arg": JSON.stringify({
+        path, mode: "overwrite", autorename: false, mute: true, strict_conflict: false,
+      }),
+    },
+    body: JSON.stringify(obj, null, 2),
+  });
+  if (!res.ok) console.warn(`uploadJsonFile ${path}:`, (await res.text()).slice(0, 200));
+}
+
+async function writeStatus(payload) {
+  try {
+    await ensureFolder(STATUS_FOLDER);
+    await uploadJsonFile(`${STATUS_FOLDER}/agent_3_last_run.json`, {
+      agent: "agent_3_publisher",
+      ...payload,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn("writeStatus failed:", err.message);
   }
 }
 
@@ -594,12 +623,12 @@ export default async function handler(req, res) {
     await ensureFolder(DONE_FOLDER);
 
     if (channelsForToday.length === 0) {
-      return res.status(200).json({
-        ok: true,
-        day,
+      const payload = {
+        ok: true, day,
         message: `No channels scheduled for ${day}. Schedule: ${JSON.stringify(SCHEDULE)}`,
-        timestamp: new Date().toISOString(),
-      });
+      };
+      await writeStatus(payload);
+      return res.status(200).json({ ...payload, timestamp: new Date().toISOString() });
     }
 
     const entries = await listFolder(PUBLISHED_FOLDER);
@@ -610,22 +639,20 @@ export default async function handler(req, res) {
       console.log(`[${channel}]`, JSON.stringify(r));
     }
 
-    return res.status(200).json({
+    const payload = {
       ok: true,
       day,
       dryRun,
       channels: channelsForToday,
       filesInPublished: entries.filter((e) => e[".tag"] === "file").map((e) => e.name),
       results,
-      timestamp: new Date().toISOString(),
-    });
+    };
+    await writeStatus(payload);
+    return res.status(200).json({ ...payload, timestamp: new Date().toISOString() });
   } catch (err) {
     console.error("Agent 3 failed:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-      stack: err.stack,
-      timestamp: new Date().toISOString(),
-    });
+    const payload = { ok: false, error: err.message, stack: err.stack };
+    await writeStatus(payload).catch(() => {});
+    return res.status(500).json({ ...payload, timestamp: new Date().toISOString() });
   }
 }
