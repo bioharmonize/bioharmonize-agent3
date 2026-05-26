@@ -1,7 +1,7 @@
 // BioHarmonize Agent 3: Auto-Publisher (self-contained Vercel function)
 // Cron runs daily at 16:00 UTC (9am PT during PDT, 8am PT during PST).
 // Based on day-of-week, publishes approved content from Dropbox /BioHarmonize/03_Published/
-// to: Shopify (Thu), Reddit + Klaviyo (Fri), Typefully scheduled X thread (Sat).
+// to: Shopify (Thu), Reddit + Klaviyo (Fri), X thread (Sat).
 // Successfully published files are moved to /BioHarmonize/04_Done/.
 //
 // Env vars (required for Dropbox + the channels you want active):
@@ -9,11 +9,13 @@
 //   SHOPIFY_STORE_DOMAIN (e.g. "bioharmonize.myshopify.com"), SHOPIFY_ADMIN_TOKEN, SHOPIFY_BLOG_HANDLE (default "field-notes")
 //   REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD, REDDIT_SUBREDDIT (default "bioharmonize")
 //   KLAVIYO_API_KEY, KLAVIYO_LIST_ID, KLAVIYO_FROM_EMAIL (default "hello@bioharmonize.co"), KLAVIYO_FROM_NAME (default "BioHarmonize")
-//   TYPEFULLY_API_KEY
+//   X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET (OAuth 1.0a)
 // Optional:
 //   CRON_SECRET (if set, requires Bearer header)
 //   FORCE_DAY (override day-of-week for testing, e.g. "thursday")
 //   DRY_RUN (if "1", logs what would be published but doesn't actually publish or move files)
+
+import crypto from "crypto";
 
 // ============================================================================
 // CONFIG
@@ -27,7 +29,7 @@ const STATUS_FOLDER = "/BioHarmonize/_status";
 const SCHEDULE = {
   thursday: ["shopify"],
   friday: ["reddit", "klaviyo"],
-  saturday: ["typefully"],
+  saturday: ["x"],
 };
 
 // ============================================================================
@@ -499,43 +501,100 @@ async function publishToKlaviyo({ slug, content }) {
 }
 
 // ============================================================================
-// TYPEFULLY PUBLISHER (creates a draft thread for X)
+// X (TWITTER) PUBLISHER (OAuth 1.0a, posts thread directly via X API v2)
 // ============================================================================
 
-async function publishToTypefully({ slug, content }) {
-  if (!has("TYPEFULLY_API_KEY")) {
-    return { skipped: true, reason: "TYPEFULLY_API_KEY not set" };
+function pctEncode(s) {
+  // RFC 3986 percent encoding (encodeURIComponent + escape !, *, ', (, ))
+  return encodeURIComponent(s).replace(/[!*'()]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+function buildOAuthAuthHeader({ method, url, oauthParams, consumerSecret, tokenSecret, bodyParams = {} }) {
+  // Combine OAuth params + body params for signature base string
+  const allParams = { ...oauthParams, ...bodyParams };
+  const sortedKeys = Object.keys(allParams).sort();
+  const paramString = sortedKeys.map((k) => `${pctEncode(k)}=${pctEncode(allParams[k])}`).join("&");
+  const baseString = [method.toUpperCase(), pctEncode(url), pctEncode(paramString)].join("&");
+  const signingKey = `${pctEncode(consumerSecret)}&${pctEncode(tokenSecret)}`;
+  const signature = crypto.createHmac("sha1", signingKey).update(baseString).digest("base64");
+  const headerParams = { ...oauthParams, oauth_signature: signature };
+  const headerValue = "OAuth " + Object.keys(headerParams).sort().map((k) =>
+    `${pctEncode(k)}="${pctEncode(headerParams[k])}"`
+  ).join(", ");
+  return headerValue;
+}
+
+async function postOneTweet({ text, replyToId, creds }) {
+  const url = "https://api.x.com/2/tweets";
+  const oauthParams = {
+    oauth_consumer_key: creds.consumerKey,
+    oauth_nonce: crypto.randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+    oauth_token: creds.token,
+    oauth_version: "1.0",
+  };
+  // For JSON-body requests to X v2, body params are NOT included in OAuth signature
+  // (only query string params would be). So we pass empty bodyParams.
+  const authHeader = buildOAuthAuthHeader({
+    method: "POST",
+    url,
+    oauthParams,
+    consumerSecret: creds.consumerSecret,
+    tokenSecret: creds.tokenSecret,
+    bodyParams: {},
+  });
+  const body = replyToId
+    ? { text, reply: { in_reply_to_tweet_id: replyToId } }
+    : { text };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: authHeader,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`X API ${res.status}: ${txt.slice(0, 300)}`);
   }
-  const apiKey = process.env.TYPEFULLY_API_KEY;
+  const data = await res.json();
+  const id = data?.data?.id;
+  if (!id) throw new Error(`X returned no tweet id: ${JSON.stringify(data).slice(0, 300)}`);
+  return id;
+}
+
+async function publishToX({ slug, content }) {
+  if (!has("X_API_KEY") || !has("X_API_SECRET") || !has("X_ACCESS_TOKEN") || !has("X_ACCESS_TOKEN_SECRET")) {
+    return { skipped: true, reason: "X credentials not fully set (X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET all required)" };
+  }
   const posts = parseXThread(content);
   if (posts.length === 0) throw new Error("X thread has no posts after parsing");
 
-  // Typefully uses 4 newlines to separate tweets in a thread
-  const typefullyContent = posts.join("\n\n\n\n");
+  const creds = {
+    consumerKey: process.env.X_API_KEY,
+    consumerSecret: process.env.X_API_SECRET,
+    token: process.env.X_ACCESS_TOKEN,
+    tokenSecret: process.env.X_ACCESS_TOKEN_SECRET,
+  };
 
-  const res = await fetch("https://api.typefully.com/v1/drafts/", {
-    method: "POST",
-    headers: {
-      "X-API-KEY": apiKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      content: typefullyContent,
-      threadify: false,
-      share: true,
-      auto_retweet_enabled: false,
-      auto_plug_enabled: false,
-    }),
-  });
-  if (!res.ok) throw new Error(`Typefully draft failed: ${res.status} ${await res.text()}`);
-  const data = await res.json();
+  const tweetIds = [];
+  let previousId = null;
+  for (const text of posts) {
+    const id = await postOneTweet({ text, replyToId: previousId, creds });
+    tweetIds.push(id);
+    previousId = id;
+  }
+
+  // Get username for URL construction (default to BioHarmonize, could derive from access token)
+  const username = "BioHarmonize";
   return {
     success: true,
-    platform: "typefully",
-    draftId: data.id,
-    shareUrl: data.share_url,
-    threadLength: posts.length,
-    note: "Draft created in Typefully. Schedule or publish manually.",
+    platform: "x",
+    threadLength: tweetIds.length,
+    firstTweetUrl: `https://x.com/${username}/status/${tweetIds[0]}`,
+    tweetIds,
   };
 }
 
@@ -550,7 +609,7 @@ function findFileForChannel(channel, entries) {
     shopify: null, // canonical (no _suffix)
     reddit: "_reddit",
     klaviyo: "_klaviyo",
-    typefully: "_x",
+    x: "_x",
   };
   const suffix = suffixMap[channel];
   for (const e of entries) {
@@ -570,7 +629,7 @@ const PUBLISHERS = {
   shopify: publishToShopify,
   reddit: publishToReddit,
   klaviyo: publishToKlaviyo,
-  typefully: publishToTypefully,
+  x: publishToX,
 };
 
 async function runForChannel(channel, entries, dryRun) {
