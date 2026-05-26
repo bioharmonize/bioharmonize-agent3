@@ -516,7 +516,7 @@ async function publishToTypefully({ slug, content }) {
   const res = await fetch("https://api.typefully.com/v1/drafts/", {
     method: "POST",
     headers: {
-      "X-API-KEY": `Bearer ${apiKey}`,
+      "X-API-KEY": apiKey,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
