@@ -291,6 +291,70 @@ async function moveFile(fromPath, toPath) {
   return await res.json();
 }
 
+// Returns a 4-hour signed direct URL for a file in Dropbox. Sufficient lifetime
+// for a downstream service (Shopify, Klaviyo) to fetch the bytes immediately and
+// re-host. Returns null if the file doesn't exist.
+async function getDropboxTempImageUrl(slug, filename) {
+  const path = `/BioHarmonize/Images/${slug}/${filename}`;
+  try {
+    const res = await fetch("https://api.dropboxapi.com/2/files/get_temporary_link", {
+      method: "POST",
+      headers: { ...(await dropboxAuth()), "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      if (!/path\/not_found/.test(txt)) {
+        console.warn(`get_temporary_link failed for ${path}: ${txt.slice(0, 200)}`);
+      }
+      return null;
+    }
+    const data = await res.json();
+    return data?.link || null;
+  } catch (err) {
+    console.warn(`get_temporary_link error for ${path}:`, err.message);
+    return null;
+  }
+}
+
+// Uploads an image to Klaviyo's Images library via the Images API. Returns the
+// permanent Klaviyo CDN URL (image_url attribute). Klaviyo accepts a remote URL
+// in `import_from_url`; the server fetches it once and stores it on the
+// Klaviyo CDN. The returned URL is stable and safe to embed in email bodies.
+async function uploadImageToKlaviyoFromUrl(remoteUrl, displayName) {
+  if (!process.env.KLAVIYO_API_KEY) return null;
+  try {
+    const res = await fetch("https://a.klaviyo.com/api/images/", {
+      method: "POST",
+      headers: {
+        Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
+        "Content-Type": "application/vnd.api+json",
+        accept: "application/vnd.api+json",
+        revision: "2024-10-15",
+      },
+      body: JSON.stringify({
+        data: {
+          type: "image",
+          attributes: {
+            import_from_url: remoteUrl,
+            name: displayName,
+            hidden: false,
+          },
+        },
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`Klaviyo image upload failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json();
+    return data?.data?.attributes?.image_url || null;
+  } catch (err) {
+    console.warn(`Klaviyo image upload error:`, err.message);
+    return null;
+  }
+}
+
 // ============================================================================
 // SHOPIFY PUBLISHER (Admin GraphQL API)
 // ============================================================================
@@ -306,7 +370,15 @@ async function publishToShopify({ slug, content }) {
   // Extract title from first H1 line of markdown
   const titleMatch = content.match(/^#\s+(.+)$/m);
   const title = titleMatch ? titleMatch[1].trim() : slug.replace(/-/g, " ");
-  const bodyHtml = markdownToHtml(content);
+  let bodyHtml = markdownToHtml(content);
+
+  // Fetch a Dropbox temporary URL for the header (Agent 4 output). Shopify
+  // downloads the bytes during articleCreate and stores them permanently on
+  // its own CDN, so a 4-hour temp link is plenty. Skipped if no image exists.
+  const headerImageUrl = await getDropboxTempImageUrl(slug, "header.png");
+  if (headerImageUrl) {
+    bodyHtml = `<p><img src="${headerImageUrl}" alt="${title.replace(/"/g, "&quot;")}" style="max-width:100%;height:auto;border-radius:8px;" /></p>\n\n${bodyHtml}`;
+  }
 
   // Find blog ID by handle
   const blogsQuery = `query { blogs(first: 50) { nodes { id handle title } } }`;
@@ -347,6 +419,7 @@ async function publishToShopify({ slug, content }) {
       isPublished: true,
       publishDate: new Date().toISOString(),
       author: { name: authorName },
+      ...(headerImageUrl ? { image: { url: headerImageUrl, altText: title } } : {}),
     },
   };
   const createRes = await fetch(`https://${domain}/admin/api/2024-10/graphql.json`, {
@@ -455,7 +528,18 @@ async function publishToKlaviyo({ slug, content }) {
 
   const { subject, preview, body } = parseKlaviyo(content);
   // Convert markdown body to HTML for email
-  const bodyHtml = markdownToHtml(body);
+  let bodyHtml = markdownToHtml(body);
+
+  // Prepend the header image (Agent 4 output) so the email leads with the same
+  // visual as the blog post. Dropbox temp URL only lives 4 hours, so we
+  // re-host on Klaviyo's CDN first to get a permanent URL recipients can fetch
+  // any time after send.
+  const tempImageUrl = await getDropboxTempImageUrl(slug, "header.png");
+  if (tempImageUrl) {
+    const klaviyoImageUrl = await uploadImageToKlaviyoFromUrl(tempImageUrl, `${slug}-header`);
+    const finalUrl = klaviyoImageUrl || tempImageUrl;
+    bodyHtml = `<p style="margin:0 0 16px;"><img src="${finalUrl}" alt="${subject.replace(/"/g, "&quot;")}" style="display:block;width:100%;max-width:600px;height:auto;border-radius:8px;" /></p>\n\n${bodyHtml}`;
+  }
   const fullHtml = `<!DOCTYPE html><html><body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #222; line-height: 1.6;">${bodyHtml}</body></html>`;
 
   const headers = {
