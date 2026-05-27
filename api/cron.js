@@ -31,7 +31,7 @@ const AGENT_NAME = "agent_3_publisher";
 const SCHEDULE = {
   thursday: ["shopify"],
   friday: ["reddit", "klaviyo"],
-  saturday: ["x"],
+  sunday: ["x"],
 };
 
 // ============================================================================
